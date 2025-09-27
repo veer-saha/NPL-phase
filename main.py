@@ -41,19 +41,27 @@ BASE_URL = "https://www.politifact.com/factchecks/list/"
 # SpaCy setup: Robustly handle model download for Streamlit Cloud
 @st.cache_resource
 def load_spacy_model():
-    """Attempts to load SpaCy model, downloading it via subprocess if missing."""
+    """
+    Attempts to load SpaCy model. If missing, attempts direct installation 
+    via pip, which is often more reliable than 'spacy download' in cloud environments.
+    """
     model_name = "en_core_web_sm"
     try:
+        # 1. Try loading the model directly
         nlp = spacy.load(model_name)
     except OSError:
-        st.warning(f"SpaCy model '{model_name}' not found. Attempting to download now...")
+        st.warning(f"SpaCy model '{model_name}' not found. Attempting to install via pip now...")
         try:
-            # Use subprocess to run the download command
-            subprocess.check_call([sys.executable, "-m", "spacy", "download", model_name])
+            # 2. If load fails, install the model package directly via pip
+            subprocess.check_call([sys.executable, "-m", "pip", "install", model_name])
+            
+            # 3. Reload the model
             nlp = spacy.load(model_name)
-            st.success("SpaCy model downloaded and loaded successfully!")
+            st.success("SpaCy model package installed and loaded successfully!")
         except subprocess.CalledProcessError as e:
-            st.error(f"Failed to download SpaCy model: {e}")
+            # The installation failed. Output a detailed error.
+            st.error(f"Failed to install SpaCy model: Command returned non-zero exit status {e.returncode}. This usually means installation commands are blocked by the cloud environment.")
+            st.info("You may need to restart the app deployment, or ensure 'en_core_web_sm' is listed in your `requirements.txt` to install it before the app starts.")
             raise RuntimeError("SpaCy model setup failed.")
     
     return nlp
@@ -501,8 +509,9 @@ def app():
             st.markdown("##### The Trade-off Chart: Speed vs. Brains")
             
             # Select axis for scatter plot
-            x_axis = st.selectbox("X-Axis (Effort/Speed):", metrics, index=metrics.index('Training Time (s)'))
-            y_axis = st.selectbox("Y-Axis (Quality):", metrics, index=metrics.index('Accuracy'))
+            metrics = df_results.columns.drop('Model').tolist()
+            x_axis = st.selectbox("X-Axis (Effort/Speed):", metrics, key='x_axis', index=metrics.index('Training Time (s)'))
+            y_axis = st.selectbox("Y-Axis (Quality):", metrics, key='y_axis', index=metrics.index('Accuracy'))
 
             # Plotting logic for trade-off (Matplotlib)
             fig, ax = plt.subplots(figsize=(6, 4))
@@ -512,6 +521,7 @@ def app():
             
             # Annotate points
             for i, row in df_results.iterrows():
+                # Adjust annotation position slightly to avoid overlap
                 ax.annotate(row['Model'].replace(' ', '\n'), (row[x_axis] * 1.02, row[y_axis] * 0.98), fontsize=8)
             
             ax.set_xlabel(x_axis)
@@ -528,8 +538,8 @@ def app():
     st.markdown(
         """
         - ⚠️ **Web Scraping Caution**: Scraping `politifact.com` may be slow and can be stopped by the website. The app stops automatically when it finds claims older than your start date.
-        - **SpaCy Fix**: The model automatically downloads `en_core_web_sm` on first run via `subprocess`, which makes deployment on Streamlit Cloud reliable.
-        - **To run this app**, ensure your repository contains this `app.py` file and the correct `requirements.txt`.
+        - **SpaCy Fix**: We've switched to a more aggressive installation method (`pip install`) inside the code, which is the last-ditch effort for persistent model loading on Streamlit Cloud.
+        - **If the error persists**: You MUST ensure **`en_core_web_sm`** is added as its own line in your **`requirements.txt`** file. Streamlit Cloud should install it during the initial setup phase, before the app starts.
         """
     )
 
