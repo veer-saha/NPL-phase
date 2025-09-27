@@ -20,6 +20,9 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.neighbors import KNeighborsClassifier
 from scipy import sparse
 import warnings
+# ADDED: Imports for Web Scraping
+import requests
+from bs4 import BeautifulSoup
 
 # --- NEW NLP Imports (SpaCy & TextBlob) ---
 import spacy
