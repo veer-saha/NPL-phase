@@ -22,6 +22,8 @@ from scipy import sparse
 import warnings
 # ADDED: Imports for Web Scraping
 import requests
+# NOTE: The 'bs4' library requires 'beautifulsoup4' package. 
+# Make sure you have 'beautifulsoup4' installed in your environment.
 from bs4 import BeautifulSoup
 
 # --- NEW NLP Imports (SpaCy & TextBlob) ---
@@ -87,6 +89,10 @@ def semantic_features(X_series):
 
     X_features = pd.DataFrame(X_series.apply(process).tolist(),
                               columns=["polarity_scaled", "subjectivity"])
+    # If the semantic features are all zero (e.g., text is empty), we must handle the shape for training
+    if X_features.empty:
+        return np.array([0.0, 0.0])
+        
     return X_features.values # Return as NumPy array
 
 def discourse_features(X_series):
@@ -120,6 +126,7 @@ def get_classifiers():
     """Returns a dictionary of ML models for cross-comparison."""
     return {
         "Logistic Regression": LogisticRegression(max_iter=1000, solver='liblinear', random_state=42),
+        # SVC dual='auto' handles large datasets better, but LinearSVC is faster
         "Support Vector Machine": LinearSVC(max_iter=10000, random_state=42, dual='auto'),
         "Naive Bayes Classification": MultinomialNB(),
         "Decision Tree Classification": DecisionTreeClassifier(random_state=42),
@@ -167,6 +174,8 @@ def execute_model_evaluation(model_name: str, X_features, y):
 def analyze_model_performance(nlp_phase: str) -> pd.DataFrame:
     """
     Executes the training and evaluation of ALL 4 ML classifiers across the selected NLP phase.
+    
+    NOTE: Removed the 5000 row limit per user request.
     """
     
     if not os.path.exists(SCRAPED_DATA_PATH):
@@ -181,9 +190,8 @@ def analyze_model_performance(nlp_phase: str) -> pd.DataFrame:
     
     data = df[[text_col, label_col]].dropna()
     
-    SAMPLE_N = min(5000, len(data))
-    if SAMPLE_N > 0 and len(data) > SAMPLE_N:
-        data = data.sample(SAMPLE_N, random_state=42).reset_index(drop=True)
+    # Removed the sample size limit (SAMPLE_N) here as requested.
+    data = data.reset_index(drop=True)
 
     X_series = data[text_col].astype(str)
     y_raw = data[label_col]
@@ -205,7 +213,13 @@ def analyze_model_performance(nlp_phase: str) -> pd.DataFrame:
     }
 
     st.warning(f"Extracting features using the **{nlp_phase}** pipeline...")
+    # NOTE: This will now run on the full dataset, which may take longer.
     X_features = phase_map[nlp_phase](X_series)
+    
+    # Handle the case where Semantic or Pragmatic features return a dense numpy array
+    if not sparse.issparse(X_features) and isinstance(X_features, np.ndarray):
+        X_features = X_features
+    
     st.success(f"Features extracted. Feature matrix shape: {X_features.shape}")
     
     # --- 2. RUN ALL CLASSIFIERS ---
@@ -240,8 +254,8 @@ def analyze_model_performance(nlp_phase: str) -> pd.DataFrame:
 
 
 # ------------------ DATA EXTRACTION (Web Scraper) ------------------
-# (The scraping logic remains unchanged from the previous version)
-
+# We use st.cache_data to cache the result of scraping if the dates don't change
+@st.cache_data(ttl=600) # Cache for 10 minutes
 def scrape_data_by_date_range(start_date: date, end_date: date) -> pd.DataFrame:
     """
     WEB SCRAPING FUNCTION: Extracts claims from politifact.com based on the date range.
@@ -250,6 +264,7 @@ def scrape_data_by_date_range(start_date: date, end_date: date) -> pd.DataFrame:
     csv_file = SCRAPED_DATA_PATH 
     all_rows = []
 
+    # Ensure CSV file is cleared and header written
     with open(csv_file, mode='w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
         writer.writerow(["author", "statement", "source", "claim_date", "label"])
@@ -266,6 +281,7 @@ def scrape_data_by_date_range(start_date: date, end_date: date) -> pd.DataFrame:
         placeholder.text(f"Fetching page {page_count}...")
         
         try:
+            # Need requests and BeautifulSoup here.
             response = requests.get(current_url, timeout=10)
             response.raise_for_status() 
             soup = BeautifulSoup(response.text, "html.parser")
@@ -315,6 +331,7 @@ def scrape_data_by_date_range(start_date: date, end_date: date) -> pd.DataFrame:
                 if statement and label:
                     page_rows.append([author, statement, source, claim_date_str, label])
 
+        # Write current page data to CSV
         with open(csv_file, mode='a', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
             writer.writerows(page_rows)
@@ -323,6 +340,7 @@ def scrape_data_by_date_range(start_date: date, end_date: date) -> pd.DataFrame:
         if stop_scraping:
             break
             
+        # Find "Next" page link
         next_link = soup.find("a", class_="c-button c-button--hollow", string=re.compile(r"Next", re.I))
         if next_link and 'href' in next_link.attrs:
             next_href = next_link['href'].rstrip('&').rstrip('?')
@@ -374,6 +392,8 @@ def app():
         st.markdown("---")
         st.subheader("Data Extraction (Politifact)")
         st.markdown("Define the date range to scrape claims for training.")
+        st.warning("Ensure the **`beautifulsoup4`** library is installed in your environment for the scraper to run.")
+
 
         # Date Input Fields
         today = date.today()
@@ -385,7 +405,8 @@ def app():
         with col_end:
             end_date = st.date_input("End Date (Maximum)", today)
             
-        st.caption(f"Max 5,000 recent claims will be used for training.")
+        # Removed the row limit note since it was removed from the code
+        st.caption(f"All claims in the date range will be used for training.")
 
         # Scrape Button
         if st.button("▶️ 1. Run Web Scraper and Save CSV", use_container_width=True, type="primary"):
@@ -494,7 +515,10 @@ def app():
             # Humorous Model Critique based on Accuracy
             best_model = results_df['Accuracy'].idxmax()
             best_accuracy = results_df['Accuracy'].max()
-            best_report = json.loads(results_df.loc[best_model, 'report_full'])
+            
+            # Only load report if it exists
+            best_report_json = results_df.loc[best_model, 'report_full']
+            best_report = json.loads(best_report_json) if best_report_json else {}
 
             worst_model = results_df['Accuracy'].idxmin()
             worst_accuracy = results_df['Accuracy'].min()
@@ -521,21 +545,30 @@ def app():
         
         col_report, col_cm = st.columns(2)
 
-        with col_report:
-            st.caption("Full Classification Report (Per Class and Averages)")
-            report_df = pd.DataFrame(best_report).transpose().round(4)
-            st.dataframe(report_df, use_container_width=True)
+        if best_report:
+            with col_report:
+                st.caption("Full Classification Report (Per Class and Averages)")
+                report_df = pd.DataFrame(best_report).transpose().round(4)
+                st.dataframe(report_df, use_container_width=True)
 
-        with col_cm:
-            st.caption("Confusion Matrix (How the algorithm failed)")
-            cm_data = np.array(json.loads(results_df.loc[best_model, 'cm']))
-            fig, ax = plt.subplots()
-            cax = ax.matshow(cm_data, cmap=plt.cm.Blues)
-            fig.colorbar(cax)
-            ax.set_title(f'CM for {best_model}')
-            ax.set_xlabel('Predicted Label')
-            ax.set_ylabel('True Label')
-            st.pyplot(fig) # Display the plot
+            with col_cm:
+                st.caption("Confusion Matrix (How the algorithm failed)")
+                cm_data = np.array(json.loads(results_df.loc[best_model, 'cm']))
+                
+                # Check if cm_data is valid before plotting
+                if cm_data.size > 0:
+                    fig, ax = plt.subplots()
+                    cax = ax.matshow(cm_data, cmap=plt.cm.Blues)
+                    fig.colorbar(cax)
+                    ax.set_title(f'CM for {best_model}')
+                    ax.set_xlabel('Predicted Label')
+                    ax.set_ylabel('True Label')
+                    st.pyplot(fig) # Display the plot
+                else:
+                    st.warning("Confusion Matrix data is empty or invalid.")
+        else:
+            st.error("Detailed report unavailable due to an error during model evaluation.")
+
 
     # File status footer
     if os.path.exists(SCRAPED_DATA_PATH):
