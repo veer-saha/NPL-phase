@@ -1,579 +1,538 @@
+# ============================================
+# 📌 Streamlit NLP Phase-wise Model Comparator
+# ============================================
 import streamlit as st
 import pandas as pd
 import numpy as np
-from datetime import date, timedelta, datetime
-import time
-import os
+import requests
+from bs4 import BeautifulSoup
 import re
 import csv
-import json
 from urllib.parse import urljoin
-import matplotlib.pyplot as plt
-from sklearn.model_selection import train_test_split
-from sklearn.feature_extraction.text import CountVectorizer, TfidfVectorizer
-from sklearn.preprocessing import LabelEncoder
-from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
-from sklearn.naive_bayes import MultinomialNB
-from sklearn.tree import DecisionTreeClassifier
-from sklearn.svm import LinearSVC, SVC
-from sklearn.linear_model import LogisticRegression
-from sklearn.neighbors import KNeighborsClassifier
-from scipy import sparse
+from datetime import datetime
+import time
+import subprocess
+import sys
 import warnings
-# ADDED: Imports for Web Scraping
-import requests
-# NOTE: The 'bs4' library requires 'beautifulsoup4' package. 
-# Make sure you have 'beautifulsoup4' installed in your environment.
-from bs4 import BeautifulSoup
 
-# --- NEW NLP Imports (SpaCy & TextBlob) ---
+# --- NLP & ML Imports ---
 import spacy
 from spacy.lang.en.stop_words import STOP_WORDS
 from textblob import TextBlob
+from sklearn.model_selection import train_test_split
+from sklearn.feature_extraction.text import CountVectorizer, TfidfVectorizer
+from sklearn.naive_bayes import MultinomialNB
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.svm import LinearSVC
+from sklearn.metrics import accuracy_score, f1_score
+from scipy.sparse import hstack
+from sklearn.preprocessing import LabelEncoder
 
+# Suppress warnings for cleaner output
 warnings.filterwarnings("ignore")
 
-# ------------------ Configuration and Globals ------------------
-SCRAPED_DATA_PATH = "politifact_data.csv"
-COMPARISON_DATA_KEY = "comparison_data"
-SELECTED_PHASE_KEY = "selected_phase"
+# ============================
+# Global Configuration
+# ============================
+SCRAPED_DATA_PATH = 'politifact_data.csv'
+BASE_URL = "https://www.politifact.com/factchecks/list/"
 
-# Load SpaCy and define constants
+# SpaCy setup: Robustly handle model download for Streamlit Cloud
+@st.cache_resource
+def load_spacy_model():
+    """Attempts to load SpaCy model, downloading it via subprocess if missing."""
+    model_name = "en_core_web_sm"
+    try:
+        nlp = spacy.load(model_name)
+    except OSError:
+        st.warning(f"SpaCy model '{model_name}' not found. Attempting to download now...")
+        try:
+            # Use subprocess to run the download command
+            subprocess.check_call([sys.executable, "-m", "spacy", "download", model_name])
+            nlp = spacy.load(model_name)
+            st.success("SpaCy model downloaded and loaded successfully!")
+        except subprocess.CalledProcessError as e:
+            st.error(f"Failed to download SpaCy model: {e}")
+            raise RuntimeError("SpaCy model setup failed.")
+    
+    return nlp
+
 try:
-    # Use the small model for performance
-    nlp = spacy.load("en_core_web_sm")
-    stop_words = STOP_WORDS
-except OSError:
-    st.error("SpaCy model 'en_core_web_sm' not found. Please ensure it is downloaded.")
-    # Fallback in case of environment issue
-    stop_words = [] 
+    nlp = load_spacy_model()
+except RuntimeError:
+    st.stop() # Stop the app if model setup fails
 
+stop_words = STOP_WORDS
 pragmatic_words = ["must", "should", "might", "could", "will", "?", "!"]
 
-# ------------------ Feature Extractors (SpaCy/TextBlob based) ------------------
+# ============================
+# Core Functions: Data Scraping
+# ============================
 
-def lexical_features(X_series):
-    """Tokenization + Stopwords removal + Lemmatization (as a single string)."""
-    
-    @st.cache_data
-    def process(text):
-        doc = nlp(text.lower())
-        tokens = [token.lemma_ for token in doc if token.text not in stop_words and token.is_alpha]
-        return " ".join(tokens)
-        
-    X_processed = X_series.apply(process)
-    return CountVectorizer().fit_transform(X_processed)
-
-def syntactic_features(X_series):
-    """Part-of-Speech tags as features."""
-    
-    @st.cache_data
-    def process(text):
-        doc = nlp(text)
-        # Use only the coarse-grained POS tags
-        return " ".join([token.pos_ for token in doc if token.is_alpha])
-
-    X_processed = X_series.apply(process)
-    # Using TF-IDF often performs better with POS tags as features
-    return TfidfVectorizer().fit_transform(X_processed)
-
-def semantic_features(X_series):
-    """Sentiment polarity & subjectivity from TextBlob as numerical features."""
-    
-    @st.cache_data
-    def process(text):
-        blob = TextBlob(text)
-        # Scale polarity from -1..1 to 0..1 for easier plotting/comparison
-        polarity_scaled = (blob.sentiment.polarity + 1.0) / 2.0
-        return [polarity_scaled, blob.sentiment.subjectivity]
-
-    X_features = pd.DataFrame(X_series.apply(process).tolist(),
-                              columns=["polarity_scaled", "subjectivity"])
-    # If the semantic features are all zero (e.g., text is empty), we must handle the shape for training
-    if X_features.empty:
-        return np.array([0.0, 0.0])
-        
-    return X_features.values # Return as NumPy array
-
-def discourse_features(X_series):
-    """Sentence count + first word of each sentence as text features."""
-    
-    @st.cache_data
-    def process(text):
-        doc = nlp(text)
-        sentences = [sent.text.strip() for sent in doc.sents]
-        # Create a document string containing sentence count and first words
-        return f"{len(sentences)} {' '.join([s.split()[0] for s in sentences if len(s.split()) > 0])}"
-
-    X_processed = X_series.apply(process)
-    return CountVectorizer().fit_transform(X_processed)
-
-def pragmatic_features(X_series):
-    """Counts of modality & special words as numerical features."""
-    
-    @st.cache_data
-    def process(text):
-        text = text.lower()
-        return [text.count(w) for w in pragmatic_words]
-    
-    X_features = pd.DataFrame(X_series.apply(process).tolist(),
-                              columns=[f"Prag_{w.replace('?', 'QM').replace('!', 'EX')}" for w in pragmatic_words])
-    return X_features.values # Return as NumPy array
-
-# ------------------ Classifier Factory (from provided NLP code) ------------------
-
-def get_classifiers():
-    """Returns a dictionary of ML models for cross-comparison."""
-    return {
-        "Logistic Regression": LogisticRegression(max_iter=1000, solver='liblinear', random_state=42),
-        # SVC dual='auto' handles large datasets better, but LinearSVC is faster
-        "Support Vector Machine": LinearSVC(max_iter=10000, random_state=42, dual='auto'),
-        "Naive Bayes Classification": MultinomialNB(),
-        "Decision Tree Classification": DecisionTreeClassifier(random_state=42),
-    }
-
-# ------------------ ML Execution Functions ------------------
-
-def execute_model_evaluation(model_name: str, X_features, y):
-    """Trains and evaluates a single model on the given features."""
-    
-    models = get_classifiers()
-    model = models[model_name]
-
-    # Split data
-    X_train, X_test, y_train, y_test = train_test_split(
-        X_features, y, test_size=0.2, stratify=y, random_state=42
-    )
-    
-    start_time = time.time()
-    model.fit(X_train, y_train)
-    training_time = time.time() - start_time
-    
-    y_pred = model.predict(X_test)
-    acc = accuracy_score(y_test, y_pred)
-    
-    # Get target names from LabelEncoder inverse transform
-    le_instance = LabelEncoder().fit(y)
-    target_names = le_instance.inverse_transform(np.unique(y_test))
-    
-    report = classification_report(y_test, y_pred, zero_division=0, output_dict=True, target_names=target_names)
-    cm = confusion_matrix(y_test, y_pred)
-    
-    # Aggregate key metrics (using macro average for multi-class summary)
-    macro_f1 = report.get('macro avg', {}).get('f1-score', 0.0)
-    
-    return {
-        'Accuracy': acc,
-        'F1-Score (Macro)': macro_f1,
-        'Training Time (s)': training_time,
-        'cm': json.dumps(cm.tolist()),
-        'report_full': json.dumps(report)
-    }
-
-@st.cache_data(show_spinner=False)
-def analyze_model_performance(nlp_phase: str) -> pd.DataFrame:
+def scrape_data_by_date_range(start_date: datetime, end_date: datetime) -> pd.DataFrame:
     """
-    Executes the training and evaluation of ALL 4 ML classifiers across the selected NLP phase.
-    
-    NOTE: Removed the 5000 row limit per user request.
+    Scrapes fact-check data from Politifact within the given date range.
+    Stops scraping when a claim is older than the start_date.
     """
+    st.subheader("🕸️ Running Web Scraper...")
     
-    if not os.path.exists(SCRAPED_DATA_PATH):
-        st.error(f"Cannot run analysis: Scraped data file '{SCRAPED_DATA_PATH}' not found.")
-        return None 
-        
-    df = pd.read_csv(SCRAPED_DATA_PATH)
+    # 1. Setup
+    csv_file = SCRAPED_DATA_PATH
+    current_url = BASE_URL
+    scraped_rows = []
     
-    # Pre-processing and split (using hardcoded column names from politifact scrape)
-    text_col = "statement"
-    label_col = "label"
-    
-    data = df[[text_col, label_col]].dropna()
-    
-    # Removed the sample size limit (SAMPLE_N) here as requested.
-    data = data.reset_index(drop=True)
-
-    X_series = data[text_col].astype(str)
-    y_raw = data[label_col]
-    
-    le = LabelEncoder()
-    y = le.fit_transform(y_raw.astype(str))
-
-    if len(np.unique(y)) < 2:
-        st.error('Need at least two classes in the target label to train classifiers.')
-        return None
-    
-    # --- 1. FEATURE EXTRACTION based on selected Phase ---
-    phase_map = {
-        "Lexical": lexical_features,
-        "Syntactic": syntactic_features,
-        "Semantic": semantic_features,
-        "Discourse": discourse_features,
-        "Pragmatic": pragmatic_features
-    }
-
-    st.warning(f"Extracting features using the **{nlp_phase}** pipeline...")
-    # NOTE: This will now run on the full dataset, which may take longer.
-    X_features = phase_map[nlp_phase](X_series)
-    
-    # Handle the case where Semantic or Pragmatic features return a dense numpy array
-    if not sparse.issparse(X_features) and isinstance(X_features, np.ndarray):
-        X_features = X_features
-    
-    st.success(f"Features extracted. Feature matrix shape: {X_features.shape}")
-    
-    # --- 2. RUN ALL CLASSIFIERS ---
-    model_names = list(get_classifiers().keys())
-    agg_results = []
-    
-    progress_bar = st.progress(0, text=f"Starting model comparison on {nlp_phase} features...")
-    total = len(model_names)
-
-    for i, model_name in enumerate(model_names, start=1):
-        progress_bar.progress(int(i/total*100), text=f"Training: {model_name} ({i}/{total})")
-        
-        try:
-            res = execute_model_evaluation(model_name, X_features, y)
-            res['Model'] = model_name
-            agg_results.append(res)
-            
-        except Exception as e:
-            st.error(f'Error while processing model {model_name}: {e}')
-            agg_results.append({
-                'Model': model_name, 
-                'Accuracy': 0.0, 
-                'F1-Score (Macro)': 0.0,
-                'Training Time (s)': 0.0,
-                'error': str(e),
-                'cm': '[]',
-                'report_full': '{}'
-            })
-    
-    progress_bar.empty()
-    return pd.DataFrame(agg_results).set_index('Model')
-
-
-# ------------------ DATA EXTRACTION (Web Scraper) ------------------
-# We use st.cache_data to cache the result of scraping if the dates don't change
-@st.cache_data(ttl=600) # Cache for 10 minutes
-def scrape_data_by_date_range(start_date: date, end_date: date) -> pd.DataFrame:
-    """
-    WEB SCRAPING FUNCTION: Extracts claims from politifact.com based on the date range.
-    """
-    base_url = "https://www.politifact.com/factchecks/list/"
-    csv_file = SCRAPED_DATA_PATH 
-    all_rows = []
-
-    # Ensure CSV file is cleared and header written
+    # Write CSV header once (or start fresh)
     with open(csv_file, mode='w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
-        writer.writerow(["author", "statement", "source", "claim_date", "label"])
+        writer.writerow(["author", "statement", "source", "date", "label"])
 
-    current_url = base_url
-    stop_scraping = False 
-
-    st.info(f"Scraping claims from {start_date} to {end_date}...")
-    placeholder = st.empty()
     page_count = 0
-
-    while current_url and not stop_scraping:
+    placeholder = st.empty()
+    
+    while current_url:
         page_count += 1
         placeholder.text(f"Fetching page {page_count}...")
-        
+
         try:
-            # Need requests and BeautifulSoup here.
-            response = requests.get(current_url, timeout=10)
-            response.raise_for_status() 
+            response = requests.get(current_url, timeout=15)
+            response.raise_for_status()
             soup = BeautifulSoup(response.text, "html.parser")
         except requests.exceptions.RequestException as e:
-            st.error(f"Network Error during request: {e}. Stopping scrape.")
+            st.error(f"Network Error during request: {e}. Stopping scraper.")
             break
 
-        page_rows = []
-
+        cards_to_append = []
+        found_recent_claim = False
+        
         for card in soup.find_all("li", class_="o-listicle__item"):
             date_div = card.find("div", class_="m-statement__desc")
             date_text = date_div.get_text(strip=True) if date_div else None
-            claim_date_str, claim_date_obj = None, None
-
-            if date_text:
-                match = re.search(r"stated on ([A-Za-z]+\s+\d{1,2},\s+(\d{4}))", date_text)
-                if match:
-                    claim_date_str = match.group(1)
-                    try:
-                        claim_date_obj = datetime.strptime(claim_date_str, "%B %d, %Y").date() 
-                    except ValueError:
-                        continue 
+            claim_date = None
             
-            if not claim_date_obj:
+            # Date extraction and filtering
+            if date_text:
+                match = re.search(r"stated on ([A-Za-z]+\s+\d{1,2},\s+\d{4})", date_text)
+                if match:
+                    try:
+                        date_str = match.group(1)
+                        claim_date = datetime.strptime(date_str, "%B %d, %Y")
+                    except ValueError:
+                        claim_date = None # skip if date format fails
+
+            if not claim_date:
+                continue
+            
+            if claim_date < start_date:
+                # Claim is older than the user's start date, stop the entire process
+                placeholder.info(f"Reached claims older than {start_date.strftime('%Y-%m-%d')}. Stopping scrape.")
+                current_url = None
+                break 
+            
+            if claim_date > end_date:
+                # Claim is newer than the user's end date, skip this one
                 continue
 
-            if claim_date_obj < start_date:
-                stop_scraping = True
-                break
+            # Found a relevant claim within the window
+            found_recent_claim = True
             
-            if start_date <= claim_date_obj <= end_date:
-                
-                # Statement, Source, Author, Label extraction...
-                statement = card.find("div", class_="m-statement__quote").find("a", href=True).get_text(strip=True) if card.find("div", class_="m-statement__quote") and card.find("div", class_="m-statement__quote").find("a", href=True) else None
-                source = card.find("a", class_="m-statement__name").get_text(strip=True) if card.find("a", class_="m-statement__name") else None
-                
-                footer = card.find("footer", class_="m-statement__footer")
-                author = None
-                if footer:
-                    author_match = re.search(r"By\s+([^•]+)", footer.get_text(strip=True))
-                    if author_match:
-                        author = author_match.group(1).strip()
+            # --- Extract fields ---
+            statement_block = card.find("div", class_="m-statement__quote")
+            statement = statement_block.find("a", href=True).get_text(strip=True) if statement_block else None
 
-                label_img = card.find("img", alt=True)
-                label = label_img['alt'].replace('-', ' ').title() if label_img else None
+            source_a = card.find("a", class_="m-statement__name")
+            source = source_a.get_text(strip=True) if source_a else None
 
-                if statement and label:
-                    page_rows.append([author, statement, source, claim_date_str, label])
+            footer = card.find("footer", class_="m-statement__footer")
+            author = None
+            if footer:
+                author_match = re.search(r"By\s+([^•]+)", footer.get_text(strip=True))
+                if author_match:
+                    author = author_match.group(1).strip()
 
-        # Write current page data to CSV
+            label_img = card.find("img", alt=True)
+            label = label_img['alt'].replace('-', ' ').title() if label_img else None
+
+            cards_to_append.append([author, statement, source, claim_date.strftime("%Y-%m-%d"), label])
+
+        # Append rows to CSV
         with open(csv_file, mode='a', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
-            writer.writerows(page_rows)
-            all_rows.extend(page_rows)
+            writer.writerows(cards_to_append)
+        
+        scraped_rows.extend(cards_to_append)
 
-        if stop_scraping:
+        if current_url is None:
             break
-            
+
         # Find "Next" page link
         next_link = soup.find("a", class_="c-button c-button--hollow", string=re.compile(r"Next", re.I))
         if next_link and 'href' in next_link.attrs:
             next_href = next_link['href'].rstrip('&').rstrip('?')
-            current_url = urljoin(base_url, next_href)
+            current_url = urljoin(BASE_URL, next_href)
         else:
-            current_url = None 
-    
+            placeholder.info("No more pages found, scraping done.")
+            current_url = None
+
     placeholder.empty()
-
-    if all_rows:
-        df = pd.DataFrame(all_rows, columns=["author", "statement", "source", "claim_date", "label"])
-        return df
+    if scraped_rows:
+        return pd.DataFrame(scraped_rows, columns=["author", "statement", "source", "date", "label"])
     else:
-        return pd.DataFrame(columns=["author", "statement", "source", "claim_date", "label"])
+        return pd.DataFrame()
+
+# ============================
+# NLP Phase Feature Extractors
+# ============================
+
+def lexical_features(text):
+    """Tokenization + Stopwords removal + Lemmatization using SpaCy."""
+    doc = nlp(text.lower())
+    tokens = [token.lemma_ for token in doc if token.text not in stop_words and token.is_alpha]
+    return " ".join(tokens)
+
+def syntactic_features(text):
+    """Part-of-Speech (POS) tags using SpaCy."""
+    doc = nlp(text)
+    # Combine tokens and their POS tags for vectorization (e.g., 'word_NOUN')
+    pos_tags = " ".join([f"{token.text}_{token.pos_}" for token in doc if token.is_alpha])
+    return pos_tags
+
+def semantic_features(text):
+    """Sentiment polarity & subjectivity using TextBlob."""
+    blob = TextBlob(text)
+    return [blob.sentiment.polarity, blob.sentiment.subjectivity]
+
+def discourse_features(text):
+    """Sentence count + first word of each sentence using SpaCy."""
+    doc = nlp(text)
+    sentences = [sent.text.strip() for sent in doc.sents]
+    
+    # Get the first token of each non-empty sentence
+    first_words = []
+    for sent in sentences:
+        sent_doc = nlp(sent)
+        if sent_doc and sent_doc[0].is_alpha:
+            first_words.append(sent_doc[0].text)
+            
+    # Vectorize sentence count and the first words
+    return f"SENT_COUNT_{len(sentences)} {' '.join(first_words)}"
+
+def pragmatic_features(text):
+    """Counts of modality & special words."""
+    text = text.lower()
+    return [text.count(w) for w in pragmatic_words]
+
+# ============================
+# Core Functions: Model Evaluation
+# ============================
+
+def get_classifier(name: str):
+    name = name.lower()
+    if 'naive' in name:
+        return MultinomialNB()
+    elif 'decision' in name or 'tree' in name:
+        return DecisionTreeClassifier(random_state=42)
+    elif 'logistic' in name:
+        return LogisticRegression(max_iter=1000, solver='liblinear', random_state=42)
+    elif 'svm' in name or 'svc' in name:
+        return LinearSVC(max_iter=10000, random_state=42)
+    else:
+        raise ValueError(f"Unknown classifier: {name}")
 
 
-# ------------------ Streamlit UI ------------------
+@st.cache_data(show_spinner=False)
+def analyze_model_performance(data_df: pd.DataFrame, selected_phase: str) -> pd.DataFrame:
+    """
+    Processes data using the selected NLP phase and evaluates all ML models.
+    Returns a DataFrame comparing model performance.
+    """
+    st.info(f"🤖 Training models on data using **{selected_phase}** features...")
+
+    # 1. Prepare Data
+    X = data_df['statement'].astype(str)
+    y_raw = data_df['label']
+    
+    # Label encode the target variable
+    le = LabelEncoder()
+    y = le.fit_transform(y_raw)
+    
+    if len(np.unique(y)) < 2:
+        st.error("Target label has fewer than two classes. Cannot train a classifier.")
+        return pd.DataFrame()
+
+    # 2. Feature Extraction based on selected phase
+    X_processed = X
+    X_features = None
+
+    # Time feature extraction
+    start_time = time.time()
+    
+    if selected_phase in ['Lexical & Morphological', 'Syntactic', 'Discourse']:
+        # These phases use Count/TFIDF Vectorization
+        
+        if selected_phase == 'Lexical & Morphological':
+            X_processed = X.apply(lexical_features)
+        elif selected_phase == 'Syntactic':
+            X_processed = X.apply(syntactic_features)
+        elif selected_phase == 'Discourse':
+            X_processed = X.apply(discourse_features)
+
+        # Use CountVectorizer for Lexical/Syntactic/Discourse features
+        try:
+            vectorizer = CountVectorizer()
+            X_features = vectorizer.fit_transform(X_processed)
+        except Exception as e:
+            st.error(f"Error during vectorization: {e}")
+            return pd.DataFrame()
+
+    elif selected_phase == 'Semantic':
+        # Semantic features are numeric (Polarity, Subjectivity)
+        X_features = pd.DataFrame(X.apply(semantic_features).tolist(), columns=["polarity", "subjectivity"])
+        
+    elif selected_phase == 'Pragmatic':
+        # Pragmatic features are numeric (Counts of modality words)
+        X_features = pd.DataFrame(X.apply(pragmatic_features).tolist(), columns=pragmatic_words)
+
+    # 3. Handle data split and dimensionality
+    # If X_features is a DataFrame (Semantic/Pragmatic), convert to sparse matrix for compatibility with ML models
+    if isinstance(X_features, pd.DataFrame):
+        X_features = X_features.values
+    
+    X_train, X_test, y_train, y_test = train_test_split(
+        X_features, y, test_size=0.2, stratify=y, random_state=42
+    )
+
+    # 4. Train and Evaluate Models
+    results_list = []
+    models = {
+        "Naive Bayes": MultinomialNB(),
+        "Decision Tree": DecisionTreeClassifier(random_state=42),
+        "Logistic Regression": LogisticRegression(max_iter=1000, solver='liblinear', random_state=42),
+        "SVM (Linear SVC)": LinearSVC(max_iter=10000, random_state=42)
+    }
+
+    progress_bar = st.progress(0, text="Training models...")
+    total_models = len(models)
+    
+    for i, (name, model) in enumerate(models.items()):
+        
+        # Training Time
+        train_start = time.time()
+        try:
+            model.fit(X_train, y_train)
+            train_time = time.time() - train_start
+            
+            # Inference Time & Metrics
+            inference_start = time.time()
+            y_pred = model.predict(X_test)
+            inference_time = (time.time() - inference_start) * 1000 # to ms
+
+            acc = accuracy_score(y_test, y_pred)
+            f1 = f1_score(y_test, y_pred, average='weighted', zero_division=0)
+
+            results_list.append({
+                "Model": name,
+                "Accuracy": acc,
+                "F1-Score": f1,
+                "Training Time (s)": round(train_time, 2),
+                "Inference Latency (ms)": round(inference_time / len(y_test) * 1000, 2), # ms per sample
+                "Report": None # Placeholder for detailed report if needed
+            })
+        except Exception as e:
+            st.error(f"Model '{name}' failed during training: {e}")
+            results_list.append({
+                "Model": name, "Accuracy": 0.0, "F1-Score": 0.0, "Training Time (s)": 0.0, "Inference Latency (ms)": 0.0, "Report": str(e)
+            })
+
+        progress_bar.progress((i + 1) / total_models, text=f"Trained {i+1}/{total_models} models.")
+
+    progress_bar.empty()
+    st.success(f"Training complete! Feature extraction time: {round(time.time() - start_time, 2)}s")
+
+    return pd.DataFrame(results_list)
+
+# ============================
+# Streamlit App Layout
+# ============================
 
 def app():
     st.set_page_config(
-        page_title="Model vs NLP Phase Comparator",
-        layout="wide",
-        initial_sidebar_state="expanded"
+        page_title='AI Fact-Checker Benchmarker',
+        layout='wide',
+        initial_sidebar_state='expanded'
     )
-    st.title("🤖 Model vs NLP Phase Comparator")
-    st.markdown("Benchmarking multiple ML algorithms against a unified NLP feature set from Politifact claims.")
+    st.title('Politifact Fact-Checker Benchmark')
+    st.caption('Where machine learning models fight over who can spot the most believable lies.')
 
-    if COMPARISON_DATA_KEY not in st.session_state:
-        st.session_state[COMPARISON_DATA_KEY] = None
-    if SELECTED_PHASE_KEY not in st.session_state:
-        st.session_state[SELECTED_PHASE_KEY] = "Lexical"
+    # Define paths and columns
+    SCRAPED_DATA_PATH = 'politifact_data.csv'
+    
+    # Initialize session state for data persistence
+    if 'scraped_df' not in st.session_state:
+        st.session_state.scraped_df = pd.DataFrame()
+    if 'model_results_df' not in st.session_state:
+        st.session_state.model_results_df = pd.DataFrame()
 
-    # ====================================================================
-    # LEFT SECTION (Sidebar) - Data Extraction and Control
-    # ====================================================================
+    # --- 1. Left Section (Sidebar: Controls & Scraping) ---
     with st.sidebar:
-        st.header("1. Data & NLP Pipeline Controls")
-
-        # NLP PHASE SELECTION (NEW FOCUS)
-        st.subheader("Choose NLP Feature Phase")
-        nlp_phase = st.selectbox('Feature Pipeline for all Models:', [
-            'Lexical',
-            'Syntactic',
-            'Semantic',
-            'Discourse',
-            'Pragmatic'
-        ], index=0, key=SELECTED_PHASE_KEY)
-
-        st.markdown("---")
-        st.subheader("Data Extraction (Politifact)")
-        st.markdown("Define the date range to scrape claims for training.")
-        st.warning("Ensure the **`beautifulsoup4`** library is installed in your environment for the scraper to run.")
-
-
-        # Date Input Fields
-        today = date.today()
-        default_start = today - timedelta(days=30)
+        st.header('1. Data Acquisition')
         
-        col_start, col_end = st.columns(2)
-        with col_start:
-            start_date = st.date_input("Start Date (Minimum)", default_start)
-        with col_end:
-            end_date = st.date_input("End Date (Maximum)", today)
+        # Date selection for web scraping
+        end_date = st.date_input("End Date (Newest Claim):", datetime.today().date())
+        start_date = st.date_input("Start Date (Oldest Claim):", datetime(2023, 1, 1).date())
+
+        if st.button('Scrape Data & Generate CSV'):
+            # Convert date objects to datetime for function
+            dt_start = datetime.combine(start_date, datetime.min.time())
+            dt_end = datetime.combine(end_date, datetime.max.time())
+
+            if dt_start > dt_end:
+                st.error("Error: Start Date must be before or equal to End Date.")
+            else:
+                with st.spinner(f"Initiating digital archeology... scraping claims between {start_date} and {end_date}."):
+                    scraped_df = scrape_data_by_date_range(dt_start, dt_end)
+                    
+                    if not scraped_df.empty:
+                        st.session_state.scraped_df = scraped_df
+                        st.success(f"Scraping complete! {len(scraped_df)} claims ready for analysis.")
+                    else:
+                        st.session_state.scraped_df = pd.DataFrame()
+                        st.warning("Scraping returned no claims in the specified date range.")
+
+        # --- Model Control (Runs only if data is present) ---
+        if not st.session_state.scraped_df.empty:
+            st.markdown('---')
+            st.header('2. Model Benchmarking')
             
-        # Removed the row limit note since it was removed from the code
-        st.caption(f"All claims in the date range will be used for training.")
-
-        # Scrape Button
-        if st.button("▶️ 1. Run Web Scraper and Save CSV", use_container_width=True, type="primary"):
-            if start_date > end_date:
-                st.error("Error: Start Date must be before or equal to End Date. The laws of physics apply.")
-            else:
-                with st.spinner(f"Initiating digital archeology... scraping data between {start_date} and {end_date}..."):
-                    scraped_df = scrape_data_by_date_range(start_date, end_date)
-                
-                if not scraped_df.empty:
-                    st.success(f"Scraping complete! {len(scraped_df)} claims extracted and saved to CSV.")
-                    st.dataframe(scraped_df.head(), use_container_width=True)
-                else:
-                    st.warning("No claims found within the specified date range. Try expanding the dates.")
-
-        st.markdown("---")
-
-        # Model Analysis Button
-        if st.button("🧠 2. Run Model Comparison", use_container_width=True):
-            if not os.path.exists(SCRAPED_DATA_PATH):
-                st.error("Please run the Web Scraper first. The algorithms need data!")
-            else:
-                with st.spinner(f"Running 4 models on the **{nlp_phase}** feature set... this will take a moment."):
-                    model_results_df = analyze_model_performance(nlp_phase)
-                
-                if model_results_df is not None:
-                    st.session_state[COMPARISON_DATA_KEY] = model_results_df
-                    st.success("Analysis complete! Results ready for display.")
-
-
-    # ====================================================================
-    # MAIN AREA (Center and Right) - Display and Comparison
-    # ====================================================================
-
-    st.markdown("---")
-    st.header(f"2. Model Comparison on: **{st.session_state[SELECTED_PHASE_KEY]}** Features")
-
-    results_df = st.session_state[COMPARISON_DATA_KEY]
-
-    if results_df is None:
-        st.info("👈 Please complete steps 1 and 2 in the sidebar to run the analysis and populate this dashboard.")
-
-    else:
-        # Get all metric columns, excluding the stored report/matrix data
-        metric_cols = [col for col in results_df.columns if col not in ['cm', 'report_full']]
-
-        col_select, col_empty = st.columns([1, 4])
-
-        with col_select:
-            # User selects primary metrics for the center chart
-            primary_metrics = st.multiselect(
-                "Select Metrics for Center Chart",
-                options=[c for c in metric_cols if 'Time' not in c], # Exclude time by default
-                default=['Accuracy', 'F1-Score (Macro)']
+            # Choose the NLP Feature Set (Phase)
+            phases = [
+                "Lexical & Morphological",
+                "Syntactic",
+                "Semantic",
+                "Discourse",
+                "Pragmatic"
+            ]
+            selected_phase = st.selectbox(
+                "Select NLP Feature Phase:",
+                phases,
+                help="Choose which set of language features (e.g., just words, or sentence structure) the ML models will use."
             )
 
-
-        col_center, col_right = st.columns([3, 2], gap="large")
-
-        # --- CENTER SECTION (Primary Visualization) ---
-        with col_center:
-            st.subheader("Model Head-to-Head Performance")
-            
-            if primary_metrics:
-                # Melt the DataFrame to prepare for a grouped/stacked bar chart
-                chart_data = results_df[primary_metrics].reset_index().rename(columns={'Model': 'Model Name'}).melt(
-                    id_vars='Model Name', 
-                    var_name='Metric', 
-                    value_name='Value'
-                )
-
-                st.bar_chart(
-                    chart_data, 
-                    x='Model Name', 
-                    y='Value', 
-                    color='Metric', 
-                    height=400
-                )
-                st.caption(f"Comparing performance across models using **{st.session_state[SELECTED_PHASE_KEY]}** features.")
-            else:
-                st.warning("Please select at least one metric to visualize in the chart.")
+            if st.button('Run Model Comparison'):
+                with st.spinner(f"Training 4 ML models on {len(st.session_state.scraped_df)} claims using the '{selected_phase}' feature set..."):
+                    results_df = analyze_model_performance(st.session_state.scraped_df, selected_phase)
+                    st.session_state.model_results_df = results_df
+                st.success(f"Analysis complete for the {selected_phase} phase!")
 
 
-        # --- RIGHT SECTION (Interactive Scatter Plot & Humorous Critique) ---
-        with col_right:
-            st.subheader("Interactive Trade-off Scatter Plot")
-            
-            # User selects axes for the scatter plot
-            col_x_select, col_y_select = st.columns(2)
-            with col_x_select:
-                x_axis = st.selectbox("X-Axis (Trade-off)", metric_cols, index=metric_cols.index('Training Time (s)'))
-            with col_y_select:
-                y_axis = st.selectbox("Y-Axis (Gain)", metric_cols, index=metric_cols.index('Accuracy'))
+    # --- 2. Main Columns (Center & Right) ---
+    col_center, col_right = st.columns([3, 2])
 
-            st.scatter_chart(
-                results_df.reset_index(), # Scatter chart needs columns, not index
-                x=x_axis, 
-                y=y_axis, 
-                color="Model",
-                size=50
-            )
-            st.caption("Find the 'Efficient Genius' Model: low X (cost), high Y (performance).")
-            
-            st.markdown("---")
-            
-            # Humorous Model Critique based on Accuracy
-            best_model = results_df['Accuracy'].idxmax()
-            best_accuracy = results_df['Accuracy'].max()
-            
-            # Only load report if it exists
-            best_report_json = results_df.loc[best_model, 'report_full']
-            best_report = json.loads(best_report_json) if best_report_json else {}
+    # --- Center Section: Model Comparison & Results ---
+    with col_center:
+        st.header('Center Stage: Model Performance')
 
-            worst_model = results_df['Accuracy'].idxmin()
-            worst_accuracy = results_df['Accuracy'].min()
-            
-            st.subheader("Model Status Report 😅")
-            
-            st.markdown(f"""
-            **👑 The Champ (Accuracy):** **{best_model}**
-            * **Score:** `{best_accuracy:.2%}`
-            * **Critique:** "Running on **{st.session_state[SELECTED_PHASE_KEY]}** features, this model is clearly superior. It deserves a raise (or at least better training data)."
-            """)
-            
-            st.markdown(f"""
-            **🤡 The Underdog (Accuracy):** **{worst_model}**
-            * **Score:** `{worst_accuracy:.2%}`
-            * **Critique:** "The **{worst_model}** clearly struggled with the **{st.session_state[SELECTED_PHASE_KEY]}** features. Perhaps it was distracted by a passing squirrel. We recommend rebooting and trying another NLP phase."
-            """)
-        
-        # --- BOTTOM SECTION (Detailed Report for the Best Model) ---
-        st.markdown("---")
-        st.subheader(f"3. Detailed Metrics: **{best_model}** (The Champion)")
-        
-        st.metric(label=f"Accuracy for {best_model}", value=f"{best_accuracy:.2%}")
-        
-        col_report, col_cm = st.columns(2)
-
-        if best_report:
-            with col_report:
-                st.caption("Full Classification Report (Per Class and Averages)")
-                report_df = pd.DataFrame(best_report).transpose().round(4)
-                st.dataframe(report_df, use_container_width=True)
-
-            with col_cm:
-                st.caption("Confusion Matrix (How the algorithm failed)")
-                cm_data = np.array(json.loads(results_df.loc[best_model, 'cm']))
-                
-                # Check if cm_data is valid before plotting
-                if cm_data.size > 0:
-                    fig, ax = plt.subplots()
-                    cax = ax.matshow(cm_data, cmap=plt.cm.Blues)
-                    fig.colorbar(cax)
-                    ax.set_title(f'CM for {best_model}')
-                    ax.set_xlabel('Predicted Label')
-                    ax.set_ylabel('True Label')
-                    st.pyplot(fig) # Display the plot
-                else:
-                    st.warning("Confusion Matrix data is empty or invalid.")
+        if st.session_state.scraped_df.empty:
+            st.info("Start by setting the dates and clicking 'Scrape Data' in the sidebar.")
         else:
-            st.error("Detailed report unavailable due to an error during model evaluation.")
+            st.subheader(f"Data Summary ({len(st.session_state.scraped_df)} Claims)")
+            st.dataframe(st.session_state.scraped_df.head(5), use_container_width=True)
+            
+            if st.session_state.model_results_df.empty:
+                st.warning("Click 'Run Model Comparison' in the sidebar to generate performance metrics.")
+            else:
+                st.subheader('Battle Report: Model vs. Phase')
+                
+                # Dynamic Metric Selection for Plotting
+                metrics = st.session_state.model_results_df.columns.drop('Model').tolist()
+                
+                st.session_state['plot_metric'] = st.selectbox(
+                    "Metric to Visualize:",
+                    metrics,
+                    index=metrics.index('Accuracy') if 'Accuracy' in metrics else 0
+                )
+                
+                # 1. Bar Chart Comparison
+                plot_df = st.session_state.model_results_df.sort_values(
+                    by=st.session_state.plot_metric, 
+                    ascending=False
+                )
+                
+                st.markdown(f"#### Bar Chart: {st.session_state.plot_metric}")
+                
+                # Create Altair/Streamlit chart
+                st.bar_chart(
+                    plot_df.set_index('Model')[st.session_state.plot_metric], 
+                    use_container_width=True,
+                    height=350
+                )
+                
+                st.dataframe(st.session_state.model_results_df.sort_values(by='Accuracy', ascending=False), use_container_width=True)
 
 
-    # File status footer
-    if os.path.exists(SCRAPED_DATA_PATH):
-        st.divider()
-        st.info(f"Input Data File Status: Found at `{SCRAPED_DATA_PATH}`. Last modified: {time.ctime(os.path.getmtime(SCRAPED_DATA_PATH))}")
+    # --- 3. Right Section: Humorous Analysis & Trade-offs ---
+    with col_right:
+        st.header('Right Hook: The AI Critique')
+
+        if not st.session_state.model_results_df.empty:
+            df_results = st.session_state.model_results_df.copy()
+            best_model = df_results.loc[df_results['Accuracy'].idxmax()]
+            worst_model = df_results.loc[df_results['Accuracy'].idxmin()]
+            
+            st.markdown(f"**Current Phase:** `{selected_phase}`")
+            st.markdown('---')
+
+            # Humorous Critique
+            st.markdown("##### The Judge's Ruling ⚖️")
+            st.success(f"""
+            **Winner: {best_model['Model']} ({best_model['Accuracy']:.3f} Accuracy)**
+            > "The **{best_model['Model']}** clearly understood the assignment. With the '{selected_phase}' feature set, it's operating on a higher plane of factual existence. Give it a raise! (Or at least, don't unplug it.)"
+            """)
+
+            if best_model['Model'] != worst_model['Model']:
+                st.error(f"""
+                **Loser: {worst_model['Model']} ({worst_model['Accuracy']:.3f} Accuracy)**
+                > "The poor **{worst_model['Model']}** seems to have mistaken this for a horoscope prediction session. Its performance is a solid 'Need More Coffee' grade. Maybe it needs to re-read the features."
+                """)
+            
+            st.markdown('---')
+
+            # Interactive Trade-off Plot
+            st.markdown("##### The Trade-off Chart: Speed vs. Brains")
+            
+            # Select axis for scatter plot
+            x_axis = st.selectbox("X-Axis (Effort/Speed):", metrics, index=metrics.index('Training Time (s)'))
+            y_axis = st.selectbox("Y-Axis (Quality):", metrics, index=metrics.index('Accuracy'))
+
+            # Plotting logic for trade-off (Matplotlib)
+            fig, ax = plt.subplots(figsize=(6, 4))
+            
+            # Scatter plot
+            ax.scatter(df_results[x_axis], df_results[y_axis], s=100)
+            
+            # Annotate points
+            for i, row in df_results.iterrows():
+                ax.annotate(row['Model'].replace(' ', '\n'), (row[x_axis] * 1.02, row[y_axis] * 0.98), fontsize=8)
+            
+            ax.set_xlabel(x_axis)
+            ax.set_ylabel(y_axis)
+            ax.set_title(f"Model Trade-off: {y_axis} vs. {x_axis}")
+            ax.grid(True, linestyle='--', alpha=0.6)
+            
+            st.pyplot(fig)
+            
+            st.info("The ideal model should be in the top-left corner (High Quality, Low Effort/Speed).")
+
+    st.markdown('---')
+    st.markdown('**Deployment Notes & Tips**')
+    st.markdown(
+        """
+        - ⚠️ **Web Scraping Caution**: Scraping `politifact.com` may be slow and can be stopped by the website. The app stops automatically when it finds claims older than your start date.
+        - **SpaCy Fix**: The model automatically downloads `en_core_web_sm` on first run via `subprocess`, which makes deployment on Streamlit Cloud reliable.
+        - **To run this app**, ensure your repository contains this `app.py` file and the correct `requirements.txt`.
+        """
+    )
+
 
 if __name__ == '__main__':
     app()
