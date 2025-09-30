@@ -32,6 +32,9 @@ import io
 # --- Configuration ---
 SCRAPED_DATA_PATH = 'politifact_data.csv'
 
+# Define N_SPLITS globally for display purposes
+N_SPLITS = 5 
+
 # --- SpaCy Loading Function (Robust for Streamlit Cloud) ---
 @st.cache_resource
 def load_spacy_model():
@@ -44,7 +47,7 @@ def load_spacy_model():
         st.code("""
         # Example of the line needed in requirements.txt:
         https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl
-        imbalanced-learn # New dependency for SMOTE
+        imbalanced-learn # Required for SMOTE
         """, language='text')
         raise e
 
@@ -58,12 +61,8 @@ stop_words = STOP_WORDS
 pragmatic_words = ["must", "should", "might", "could", "will", "?", "!"]
 
 # ============================
-# 1. WEB SCRAPING FUNCTION
+# 1. WEB SCRAPING FUNCTION (Remains identical to previous successful version)
 # ============================
-
-# [SCRAPING FUNCTION REMAINS UNCHANGED - (lines 53-150)]
-# (I am omitting the long scraping function here to ensure this critical block is concise, 
-# assuming you have the working version from before. It remains identical.)
 
 def scrape_data_by_date_range(start_date: pd.Timestamp, end_date: pd.Timestamp):
     base_url = "https://www.politifact.com/factchecks/list/"
@@ -183,20 +182,18 @@ def pragmatic_features(text):
 def get_classifier(name):
     """Initializes a classifier instance with hyperparameter tuning for imbalance."""
     if name == "Naive Bayes":
-        # Cannot use class_weight, but it's fast.
         return MultinomialNB()
     elif name == "Decision Tree":
-        # Use balanced class weight to penalize errors on minority classes
         return DecisionTreeClassifier(random_state=42, class_weight='balanced') 
     elif name == "Logistic Regression":
-        # Use balanced class weight
         return LogisticRegression(max_iter=1000, solver='liblinear', random_state=42, class_weight='balanced')
     elif name == "SVM":
-        # Use balanced class weight
         return SVC(kernel='linear', C=0.5, random_state=42, class_weight='balanced')
     return None
 
 def apply_feature_extraction(X, phase, vectorizer=None):
+    """Applies the chosen feature extraction technique and optimization (e.g., N-Grams)."""
+    # Note: N-Grams (1,2) added for Lexical and Discourse for better context capture
     if phase == "Lexical & Morphological":
         X_processed = X.apply(lexical_features)
         vectorizer = vectorizer if vectorizer else CountVectorizer(binary=True, ngram_range=(1,2))
@@ -229,30 +226,53 @@ def apply_feature_extraction(X, phase, vectorizer=None):
 def evaluate_models(df: pd.DataFrame, selected_phase: str):
     """Trains and evaluates models using Stratified K-Fold Cross-Validation and SMOTE."""
     
-    # 1. Data Preparation and Label Encoding
-    X_raw = df['statement'].astype(str)
-    y_raw = df['label']
-    le = LabelEncoder()
-    y = le.fit_transform(y_raw)
+    # 1. FEATURE ENGINEERING: BINARY TARGET MAPPING
     
-    if len(np.unique(y)) < 2:
-        st.error("Target column must contain at least two unique classes for classification.")
+    # Define mapping groups
+    REAL_LABELS = ["True", "No Flip", "Mostly True", "Half Flip", "Half True"]
+    FAKE_LABELS = ["False", "Barely True", "Pants On Fire", "Full Flop"]
+    
+    # Create the new binary target column
+    def create_binary_target(label):
+        if label in REAL_LABELS:
+            return 1 # Real/True
+        elif label in FAKE_LABELS:
+            return 0 # Fake/False
+        else:
+            return np.nan # Mark unmappable/error labels
+
+    df['target_label'] = df['label'].apply(create_binary_target)
+    
+    # 2. DATA CLEANING AND FILTERING
+    
+    # Drop rows where mapping failed
+    df = df.dropna(subset=['target_label'])
+    
+    # Remove rows with short statements (noise/lack of context)
+    df = df[df['statement'].astype(str).str.len() > 10]
+    
+    X_raw = df['statement'].astype(str)
+    y_raw = df['target_label'].astype(int) # Target is now explicitly 0 or 1
+    
+    # Check for required classes (must have 0 and 1 for binary classification)
+    if len(np.unique(y_raw)) < 2:
+        st.error("After binary mapping, only one class remains (all Real or all Fake). Cannot train classifier.")
         return pd.DataFrame() 
     
-    # 2. Feature Extraction (Apply to all data once per phase)
-    # We only fit the vectorizer here to ensure it's consistent across all folds.
+    # 3. Feature Extraction (Apply to all data once per phase)
     X_features_full, vectorizer = apply_feature_extraction(X_raw, selected_phase)
     
     if X_features_full is None:
         st.error("Feature extraction failed.")
         return pd.DataFrame()
         
-    # Convert X_features_full to a dense array if it's a DataFrame (for KFold indexing)
+    # Prepare data for K-Fold
     if isinstance(X_features_full, pd.DataFrame):
         X_features_full = X_features_full.values
     
-    # 3. K-Fold Setup
-    N_SPLITS = 5
+    y = y_raw.values
+    
+    # 4. K-Fold Setup
     skf = StratifiedKFold(n_splits=N_SPLITS, shuffle=True, random_state=42)
     models_to_run = {
         "Naive Bayes": MultinomialNB(),
@@ -262,27 +282,26 @@ def evaluate_models(df: pd.DataFrame, selected_phase: str):
     }
 
     model_metrics = {name: [] for name in models_to_run.keys()}
+    X_raw_list = X_raw.tolist()
 
     for name, model in models_to_run.items():
-        st.caption(f"🚀 Training {name} with {N_SPLITS}-Fold CV...")
+        st.caption(f"🚀 Training {name} with {N_SPLITS}-Fold CV & SMOTE...")
         
         fold_metrics = {
             'accuracy': [], 'f1': [], 'precision': [], 'recall': [], 'train_time': [], 'inference_time': []
         }
         
-        # We need the raw text for the feature application on each fold
-        X_raw_list = X_raw.tolist()
-        
         for fold, (train_index, test_index) in enumerate(skf.split(X_features_full, y)):
             
+            # 4a. Get data indices for this fold
             X_train_raw = pd.Series([X_raw_list[i] for i in train_index])
             X_test_raw = pd.Series([X_raw_list[i] for i in test_index])
             y_train = y[train_index]
             y_test = y[test_index]
             
-            # Re-apply feature extraction to ensure proper handling of text data in the loop
-            # If a vectorizer was used, apply transform using the fitted one.
+            # 4b. Transform the features using the fitted vectorizer (if applicable)
             if vectorizer is not None:
+                # Need to run the phase's preprocessing (lexical_features or syntactic_features) on the raw text first
                 X_train = vectorizer.transform(X_train_raw.apply(lexical_features if 'Lexical' in selected_phase else syntactic_features))
                 X_test = vectorizer.transform(X_test_raw.apply(lexical_features if 'Lexical' in selected_phase else syntactic_features))
             else:
@@ -291,22 +310,20 @@ def evaluate_models(df: pd.DataFrame, selected_phase: str):
                 X_test, _ = apply_feature_extraction(X_test_raw, selected_phase)
             
             
-            # --- SMOTE PIPELINE ---
-            # Create a pipeline to apply SMOTE *only* on the training data
-            smote_pipeline = ImbPipeline([
-                ('sampler', SMOTE(random_state=42, k_neighbors=3)),
-                ('classifier', model)
-            ])
-
             start_time = time.time()
             try:
-                # MultinomialNB requires positive integers
+                # --- SMOTE PIPELINE ---
                 if name == "Naive Bayes":
-                    X_train = X_train.abs().astype(int)
-                    # Note: We skip SMOTE for MNB since it works poorly with synthetic samples
-                    model.fit(X_train, y_train) 
+                    # MNB requires positive counts and performs poorly with synthetic floats, skip SMOTE
+                    X_train_final = X_train.abs().astype(int)
                     clf = model
+                    model.fit(X_train_final, y_train)
                 else:
+                    # Apply SMOTE to training data for other models
+                    smote_pipeline = ImbPipeline([
+                        ('sampler', SMOTE(random_state=42, k_neighbors=3)),
+                        ('classifier', model)
+                    ])
                     smote_pipeline.fit(X_train, y_train)
                     clf = smote_pipeline
                 
@@ -326,7 +343,6 @@ def evaluate_models(df: pd.DataFrame, selected_phase: str):
 
             except Exception as e:
                 st.warning(f"Fold {fold+1} failed for {name}: {e}")
-                # Append 0s for failed fold
                 for key in fold_metrics: fold_metrics[key].append(0)
                 continue
 
@@ -573,5 +589,4 @@ def app():
             
 # --- Run App ---
 if __name__ == '__main__':
-    N_SPLITS = 5 # Defined globally for use in app() and evaluate_models
     app()
