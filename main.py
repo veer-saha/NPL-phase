@@ -31,8 +31,6 @@ import io
 
 # --- Configuration ---
 SCRAPED_DATA_PATH = 'politifact_data.csv'
-
-# Define N_SPLITS globally for display purposes
 N_SPLITS = 5 
 
 # --- SpaCy Loading Function (Robust for Streamlit Cloud) ---
@@ -193,7 +191,6 @@ def get_classifier(name):
 
 def apply_feature_extraction(X, phase, vectorizer=None):
     """Applies the chosen feature extraction technique and optimization (e.g., N-Grams)."""
-    # Note: N-Grams (1,2) added for Lexical and Discourse for better context capture
     if phase == "Lexical & Morphological":
         X_processed = X.apply(lexical_features)
         vectorizer = vectorizer if vectorizer else CountVectorizer(binary=True, ngram_range=(1,2))
@@ -254,7 +251,6 @@ def evaluate_models(df: pd.DataFrame, selected_phase: str):
     X_raw = df['statement'].astype(str)
     y_raw = df['target_label'].astype(int) # Target is now explicitly 0 or 1
     
-    # Check for required classes (must have 0 and 1 for binary classification)
     if len(np.unique(y_raw)) < 2:
         st.error("After binary mapping, only one class remains (all Real or all Fake). Cannot train classifier.")
         return pd.DataFrame() 
@@ -312,10 +308,10 @@ def evaluate_models(df: pd.DataFrame, selected_phase: str):
             
             start_time = time.time()
             try:
-                # --- SMOTE PIPELINE ---
+                # --- SMOTE PIPELINE & Naive Bayes Fix ---
                 if name == "Naive Bayes":
-                    # MNB requires positive counts and performs poorly with synthetic floats, skip SMOTE
-                    X_train_final = X_train.abs().astype(int)
+                    # FIX: Use np.abs on sparse matrix to get positive counts, then convert to int/float as needed.
+                    X_train_final = np.abs(X_train).astype(float) 
                     clf = model
                     model.fit(X_train_final, y_train)
                 else:
