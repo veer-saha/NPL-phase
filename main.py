@@ -819,8 +819,10 @@ def app():
                 st.error("Please scrape data first!")
             else:
                 with st.spinner(f"Engaging {selected_phase} features... training 4 models with {N_SPLITS}-Fold CV & SMOTE!"):
-                    df_results = evaluate_models(st.session_state['scraped_df'], selected_phase)
+                    df_results, trained_models, trained_vectorizer = evaluate_models(st.session_state['scraped_df'], selected_phase)
                     st.session_state['df_results'] = df_results
+                    st.session_state['trained_models'] = trained_models
+                    st.session_state['trained_vectorizer'] = trained_vectorizer
                     st.session_state['selected_phase_run'] = selected_phase
                     st.success("Analysis complete! Prepare for the robust, cross-validated results.")
 
