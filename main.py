@@ -918,6 +918,51 @@ Google API key not found. Please add it to .streamlit/secrets.toml:
             
             st.caption(f"Chart shows how each model performed on the selected metric using the **{st.session_state['selected_phase_run']}** features. Results are averaged over {N_SPLITS} folds.")
 
+        # Google Benchmark Results Display
+        if st.session_state['google_benchmark_results'].empty is False:
+            st.divider()
+            st.subheader("Google Fact Check Benchmark Results")
+
+            google_results = st.session_state['google_benchmark_results']
+            politifacts_results = st.session_state['df_results']
+
+            # Display metrics with comparison deltas
+            st.write("**Model Performance on Google Data:**")
+            cols = st.columns(4)
+            for idx, (_, row) in enumerate(google_results.iterrows()):
+                model_name = row['Model']
+                google_accuracy = row['Accuracy']
+
+                # Find corresponding Politifacts accuracy for delta
+                politifacts_row = politifacts_results[politifacts_results['Model'] == model_name]
+                if not politifacts_row.empty:
+                    politifacts_accuracy = politifacts_row['Accuracy'].values[0]
+                    delta = google_accuracy - politifacts_accuracy
+                else:
+                    delta = None
+
+                with cols[idx]:
+                    if delta is not None:
+                        st.metric(
+                            label=model_name,
+                            value=f"{google_accuracy:.1f}%",
+                            delta=f"{delta:+.1f}%"
+                        )
+                    else:
+                        st.metric(
+                            label=model_name,
+                            value=f"{google_accuracy:.1f}%"
+                        )
+
+            # Detailed metrics table
+            st.dataframe(
+                google_results[['Model', 'Accuracy', 'F1-Score', 'Precision', 'Recall', 'Inference Latency (ms)']],
+                use_container_width=True,
+                height=200
+            )
+
+            st.caption(f"Google benchmark tested on {len(st.session_state['google_df'])} claims. Comparing against Politifacts performance with same {st.session_state['selected_phase_run']} features.")
+
 
     # ============================
     # RIGHT COLUMN (Critique & Trade-offs)
