@@ -621,8 +621,51 @@ def evaluate_models(df: pd.DataFrame, selected_phase: str):
                 "Training Time (s)": 0, "Inference Latency (ms)": 9999,
             }
 
+    # 5. TRAIN FINAL MODELS ON FULL DATASET (for Google benchmark)
+    st.caption("Training final models on complete dataset for benchmarking...")
+    trained_models_final = {}
+
+    for name in models_to_run.keys():
+        try:
+            # Get fresh model instance
+            final_model = get_classifier(name)
+
+            # Prepare features for final training
+            if vectorizer is not None:
+                # Transform using the fitted vectorizer
+                if 'Lexical' in selected_phase:
+                    X_final_processed = X_raw.apply(lexical_features)
+                elif 'Syntactic' in selected_phase:
+                    X_final_processed = X_raw.apply(syntactic_features)
+                elif 'Discourse' in selected_phase:
+                    X_final_processed = X_raw.apply(discourse_features)
+                else:
+                    X_final_processed = X_raw
+                X_final = vectorizer.transform(X_final_processed)
+            else:
+                # Dense features (Semantic/Pragmatic)
+                X_final = X_features_full
+
+            # Apply SMOTE and train (same pattern as K-Fold)
+            if name == "Naive Bayes":
+                X_final_train = np.abs(X_final).astype(float)
+                final_model.fit(X_final_train, y)
+                trained_models_final[name] = final_model
+            else:
+                # Apply SMOTE to full dataset for other models
+                smote_pipeline_final = ImbPipeline([
+                    ('sampler', SMOTE(random_state=42, k_neighbors=3)),
+                    ('classifier', final_model)
+                ])
+                smote_pipeline_final.fit(X_final, y)
+                trained_models_final[name] = smote_pipeline_final
+
+        except Exception as e:
+            st.warning(f"Failed to train final {name} model: {e}")
+            trained_models_final[name] = None
+
     results_list = list(model_metrics.values())
-    return pd.DataFrame(results_list)
+    return pd.DataFrame(results_list), trained_models_final, vectorizer
 
 # ============================
 # 4. HUMOR & CRITIQUE FUNCTIONS (REMAINS UNCHANGED)
