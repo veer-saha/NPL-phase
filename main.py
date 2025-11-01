@@ -826,6 +826,64 @@ def app():
                     st.session_state['selected_phase_run'] = selected_phase
                     st.success("Analysis complete! Prepare for the robust, cross-validated results.")
 
+        st.divider()
+        st.header("3. Real-Time Benchmark")
+        st.subheader("Google Fact Check Test 🌐")
+
+        num_google_claims = st.number_input(
+            "Number of claims to test:",
+            min_value=10,
+            max_value=1000,
+            value=100,
+            step=10,
+            key='num_google_claims'
+        )
+
+        st.caption("This will fetch live claims from Google Fact Check API and test your trained models against them.")
+
+        if st.button("Run Real-Time Benchmark 🚀"):
+            # Pre-flight check: models must be trained
+            if 'trained_models' not in st.session_state or not st.session_state['trained_models']:
+                st.error("Please train models first using 'Analyze Model Showdown'!")
+            # Pre-flight check: API key must exist
+            elif 'GOOGLE_API_KEY' not in st.secrets:
+                st.error("""
+Google API key not found. Please add it to .streamlit/secrets.toml:
+
+1. Create file: .streamlit/secrets.toml
+2. Add line: GOOGLE_API_KEY = "your-api-key-here"
+3. Get API key from: https://console.cloud.google.com/apis/credentials
+4. Enable "Fact Check Tools API" in your Google Cloud project
+""")
+            else:
+                # Execute benchmark
+                with st.spinner('Fetching and processing live data from Google...'):
+                    api_key = st.secrets["GOOGLE_API_KEY"]
+                    api_results = fetch_google_claims(api_key, num_google_claims)
+                    google_df = process_and_map_google_claims(api_results)
+
+                    if google_df.empty:
+                        st.warning("No claims were successfully processed. Try increasing the number or check API status.")
+                    elif len(google_df['ground_truth'].unique()) < 2:
+                        st.warning("Only one class found in Google data. Results may not be meaningful.")
+                        # Continue anyway - still run benchmark
+                        trained_models = st.session_state['trained_models']
+                        trained_vectorizer = st.session_state['trained_vectorizer']
+                        selected_phase_run = st.session_state['selected_phase_run']
+                        benchmark_results_df = run_google_benchmark(google_df, trained_models, trained_vectorizer, selected_phase_run)
+                        st.session_state['google_benchmark_results'] = benchmark_results_df
+                        st.session_state['google_df'] = google_df
+                        st.success(f"Benchmark complete! Tested on {len(google_df)} Google claims.")
+                    else:
+                        # Normal flow
+                        trained_models = st.session_state['trained_models']
+                        trained_vectorizer = st.session_state['trained_vectorizer']
+                        selected_phase_run = st.session_state['selected_phase_run']
+                        benchmark_results_df = run_google_benchmark(google_df, trained_models, trained_vectorizer, selected_phase_run)
+                        st.session_state['google_benchmark_results'] = benchmark_results_df
+                        st.session_state['google_df'] = google_df
+                        st.success(f"Benchmark complete! Tested on {len(google_df)} Google claims.")
+
 
     # ============================
     # CENTER COLUMN (Metrics & Visuals)
