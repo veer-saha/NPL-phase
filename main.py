@@ -63,6 +63,100 @@ stop_words = STOP_WORDS
 pragmatic_words = ["must", "should", "might", "could", "will", "?", "!"]
 
 # ============================
+# GOOGLE FACT CHECK API INTEGRATION
+# ============================
+
+def fetch_google_claims(api_key, num_claims=100):
+    """
+    Fetches claims from Google Fact Check API with pagination handling.
+
+    TODO: User must add GOOGLE_API_KEY to .streamlit/secrets.toml
+    Get your API key from: https://console.cloud.google.com/apis/credentials
+    Enable the "Fact Check Tools API" in Google Cloud Console first.
+    """
+    base_url = "https://factchecktools.googleapis.com/v1alpha1/claims:search"
+    collected_claims = []
+    page_token = None
+    placeholder = st.empty()
+
+    try:
+        while len(collected_claims) < num_claims:
+            # Build request parameters
+            params = {
+                'key': api_key,
+                'languageCode': 'en',
+                'pageSize': min(100, num_claims - len(collected_claims))
+            }
+
+            if page_token:
+                params['pageToken'] = page_token
+
+            # Update progress
+            placeholder.text(f"Fetching Google claims... {len(collected_claims)} collected so far")
+
+            # Make API request
+            response = requests.get(base_url, params=params, timeout=15)
+
+            # Check for HTTP errors
+            if response.status_code == 401:
+                st.error("Invalid API key. Please check your GOOGLE_API_KEY in .streamlit/secrets.toml")
+                return []
+            elif response.status_code == 403:
+                st.error("API access forbidden. Ensure 'Fact Check Tools API' is enabled in Google Cloud Console.")
+                return []
+            elif response.status_code == 429:
+                st.error("API rate limit exceeded. Please try again later with fewer claims.")
+                return []
+
+            response.raise_for_status()
+            data = response.json()
+
+            # Check if response has claims
+            if 'claims' not in data or not data['claims']:
+                placeholder.success(f"Fetched {len(collected_claims)} claims (no more available)")
+                break
+
+            # Process each claim
+            for claim_obj in data['claims']:
+                if len(collected_claims) >= num_claims:
+                    break
+
+                # Extract claim text
+                claim_text = claim_obj.get('text', '')
+
+                # Extract rating from first claimReview
+                claim_reviews = claim_obj.get('claimReview', [])
+                if not claim_reviews or len(claim_reviews) == 0:
+                    continue  # Skip claims without reviews
+
+                textual_rating = claim_reviews[0].get('textualRating', '')
+
+                # Skip if missing required fields
+                if not claim_text or not textual_rating:
+                    continue
+
+                collected_claims.append({
+                    'claim_text': claim_text,
+                    'rating': textual_rating
+                })
+
+            # Check for next page
+            page_token = data.get('nextPageToken')
+            if not page_token:
+                placeholder.success(f"Fetched {len(collected_claims)} claims (all pages processed)")
+                break
+
+        placeholder.success(f"Successfully fetched {len(collected_claims)} claims from Google Fact Check API")
+        return collected_claims
+
+    except requests.exceptions.RequestException as e:
+        placeholder.error(f"Network error while fetching Google claims: {e}")
+        return collected_claims if collected_claims else []
+    except Exception as e:
+        placeholder.error(f"Error processing Google API response: {e}")
+        return collected_claims if collected_claims else []
+
+# ============================
 # 1. WEB SCRAPING FUNCTION (Remains identical to previous successful version)
 # ============================
 
