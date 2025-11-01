@@ -156,6 +156,73 @@ def fetch_google_claims(api_key, num_claims=100):
         placeholder.error(f"Error processing Google API response: {e}")
         return collected_claims if collected_claims else []
 
+
+def process_and_map_google_claims(api_results):
+    """
+    Converts Google's granular ratings into binary format (1=True, 0=False) and creates DataFrame.
+    Discards ambiguous ratings like 'Half True', 'Mixed', etc.
+    """
+    if not api_results:
+        return pd.DataFrame(columns=['claim_text', 'ground_truth'])
+
+    processed_claims = []
+    true_count = 0
+    false_count = 0
+    discarded_count = 0
+
+    for claim_data in api_results:
+        claim_text = claim_data.get('claim_text', '').strip()
+        rating = claim_data.get('rating', '').strip()
+
+        # Data quality checks
+        if not claim_text or len(claim_text) < 10:
+            discarded_count += 1
+            continue
+
+        if not rating:
+            discarded_count += 1
+            continue
+
+        # Normalize rating for comparison (remove punctuation, lowercase)
+        rating_normalized = rating.lower().strip().rstrip('!').rstrip('?')
+
+        # Map to binary
+        is_true = any(rating_normalized == r.lower() for r in GOOGLE_TRUE_RATINGS)
+        is_false = any(rating_normalized == r.lower() for r in GOOGLE_FALSE_RATINGS)
+
+        if is_true:
+            processed_claims.append({
+                'claim_text': claim_text,
+                'ground_truth': 1
+            })
+            true_count += 1
+        elif is_false:
+            processed_claims.append({
+                'claim_text': claim_text,
+                'ground_truth': 0
+            })
+            false_count += 1
+        else:
+            # Ambiguous rating - discard
+            discarded_count += 1
+
+    # Create DataFrame
+    google_df = pd.DataFrame(processed_claims)
+
+    if not google_df.empty:
+        # Remove duplicates (keep first occurrence)
+        google_df = google_df.drop_duplicates(subset=['claim_text'], keep='first')
+
+    # Display statistics
+    total_processed = len(api_results)
+    st.info(f"Processed {total_processed} claims: {true_count} True, {false_count} False, {discarded_count} ambiguous (discarded)")
+
+    # Warn if only one class
+    if not google_df.empty and len(google_df['ground_truth'].unique()) < 2:
+        st.warning("Only one class found in processed claims. Results may not be meaningful.")
+
+    return google_df
+
 # ============================
 # 1. WEB SCRAPING FUNCTION (Remains identical to previous successful version)
 # ============================
