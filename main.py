@@ -31,7 +31,11 @@ import io
 
 # --- Configuration ---
 SCRAPED_DATA_PATH = 'politifact_data.csv'
-N_SPLITS = 5 
+N_SPLITS = 5
+
+# Google Fact Check API rating mappings (for binary classification)
+GOOGLE_TRUE_RATINGS = ["True", "Mostly True", "Accurate", "Correct"]
+GOOGLE_FALSE_RATINGS = ["False", "Mostly False", "Pants on Fire", "Pants on Fire!", "Fake", "Incorrect", "Baseless", "Misleading"] 
 
 # --- SpaCy Loading Function (Robust for Streamlit Cloud) ---
 @st.cache_resource
