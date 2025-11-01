@@ -223,6 +223,102 @@ def process_and_map_google_claims(api_results):
 
     return google_df
 
+
+def run_google_benchmark(google_df, trained_models, vectorizer, selected_phase):
+    """
+    Tests trained models on Google claims and calculates performance metrics.
+    """
+    if google_df.empty:
+        st.error("No Google claims available for benchmarking.")
+        return pd.DataFrame()
+
+    # Extract claim texts and ground truth labels
+    X_raw = google_df['claim_text']
+    y_true = google_df['ground_truth'].values
+
+    # Apply same feature extraction as training
+    try:
+        if selected_phase == "Lexical & Morphological":
+            X_processed = X_raw.apply(lexical_features)
+            if vectorizer is None:
+                st.error("Vectorizer not found for Lexical phase. Please retrain models.")
+                return pd.DataFrame()
+            X_features = vectorizer.transform(X_processed)
+
+        elif selected_phase == "Syntactic":
+            X_processed = X_raw.apply(syntactic_features)
+            if vectorizer is None:
+                st.error("Vectorizer not found for Syntactic phase. Please retrain models.")
+                return pd.DataFrame()
+            X_features = vectorizer.transform(X_processed)
+
+        elif selected_phase == "Discourse":
+            X_processed = X_raw.apply(discourse_features)
+            if vectorizer is None:
+                st.error("Vectorizer not found for Discourse phase. Please retrain models.")
+                return pd.DataFrame()
+            X_features = vectorizer.transform(X_processed)
+
+        elif selected_phase == "Semantic":
+            # Dense features - no vectorizer needed
+            X_features = pd.DataFrame(X_raw.apply(semantic_features).tolist(), columns=["polarity", "subjectivity"]).values
+
+        elif selected_phase == "Pragmatic":
+            # Dense features - no vectorizer needed
+            X_features = pd.DataFrame(X_raw.apply(pragmatic_features).tolist(), columns=pragmatic_words).values
+
+        else:
+            st.error(f"Unknown feature phase: {selected_phase}")
+            return pd.DataFrame()
+
+    except Exception as e:
+        st.error(f"Feature extraction failed for Google claims: {e}")
+        return pd.DataFrame()
+
+    # Test each trained model
+    results_list = []
+
+    for model_name, model in trained_models.items():
+        try:
+            # Handle Naive Bayes with negative values (same as training)
+            if model_name == "Naive Bayes":
+                X_features_model = np.abs(X_features).astype(float)
+            else:
+                X_features_model = X_features
+
+            # Measure inference time
+            start_inference = time.time()
+            y_pred = model.predict(X_features_model)
+            inference_time = (time.time() - start_inference) * 1000  # Convert to ms
+
+            # Calculate metrics
+            accuracy = accuracy_score(y_true, y_pred) * 100
+            f1 = f1_score(y_true, y_pred, average='weighted', zero_division=0)
+            precision = precision_score(y_true, y_pred, average='weighted', zero_division=0)
+            recall = recall_score(y_true, y_pred, average='weighted', zero_division=0)
+
+            results_list.append({
+                'Model': model_name,
+                'Accuracy': accuracy,
+                'F1-Score': f1,
+                'Precision': precision,
+                'Recall': recall,
+                'Inference Latency (ms)': round(inference_time, 2)
+            })
+
+        except Exception as e:
+            st.error(f"Prediction failed for {model_name}: {e}")
+            results_list.append({
+                'Model': model_name,
+                'Accuracy': 0,
+                'F1-Score': 0,
+                'Precision': 0,
+                'Recall': 0,
+                'Inference Latency (ms)': 9999
+            })
+
+    return pd.DataFrame(results_list)
+
 # ============================
 # 1. WEB SCRAPING FUNCTION (Remains identical to previous successful version)
 # ============================
