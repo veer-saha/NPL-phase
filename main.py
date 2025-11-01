@@ -767,6 +767,14 @@ def app():
         st.session_state['scraped_df'] = pd.DataFrame()
     if 'df_results' not in st.session_state:
         st.session_state['df_results'] = pd.DataFrame()
+    if 'trained_models' not in st.session_state:
+        st.session_state['trained_models'] = {}
+    if 'trained_vectorizer' not in st.session_state:
+        st.session_state['trained_vectorizer'] = None
+    if 'google_benchmark_results' not in st.session_state:
+        st.session_state['google_benchmark_results'] = pd.DataFrame()
+    if 'google_df' not in st.session_state:
+        st.session_state['google_df'] = pd.DataFrame()
 
     # ============================
     # LEFT COLUMN (Data Input & Controls)
