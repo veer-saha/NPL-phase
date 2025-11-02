@@ -31,7 +31,11 @@ import io
 
 # --- Configuration ---
 SCRAPED_DATA_PATH = 'politifact_data.csv'
-N_SPLITS = 5 
+N_SPLITS = 5
+
+# Google Fact Check API rating mappings (for binary classification)
+GOOGLE_TRUE_RATINGS = ["True", "Mostly True", "Accurate", "Correct"]
+GOOGLE_FALSE_RATINGS = ["False", "Mostly False", "Pants on Fire", "Pants on Fire!", "Fake", "Incorrect", "Baseless", "Misleading"] 
 
 # --- SpaCy Loading Function (Robust for Streamlit Cloud) ---
 @st.cache_resource
@@ -57,6 +61,263 @@ except Exception:
 
 stop_words = STOP_WORDS
 pragmatic_words = ["must", "should", "might", "could", "will", "?", "!"]
+
+# ============================
+# GOOGLE FACT CHECK API INTEGRATION
+# ============================
+
+def fetch_google_claims(api_key, num_claims=100):
+    """
+    Fetches claims from Google Fact Check API with pagination handling.
+
+    TODO: User must add GOOGLE_API_KEY to .streamlit/secrets.toml
+    Get your API key from: https://console.cloud.google.com/apis/credentials
+    Enable the "Fact Check Tools API" in Google Cloud Console first.
+    """
+    base_url = "https://factchecktools.googleapis.com/v1alpha1/claims:search"
+    collected_claims = []
+    page_token = None
+    placeholder = st.empty()
+
+    try:
+        while len(collected_claims) < num_claims:
+            # Build request parameters
+            params = {
+                'key': api_key,
+                'languageCode': 'en',
+                'pageSize': min(100, num_claims - len(collected_claims))
+            }
+
+            if page_token:
+                params['pageToken'] = page_token
+
+            # Update progress
+            placeholder.text(f"Fetching Google claims... {len(collected_claims)} collected so far")
+
+            # Make API request
+            response = requests.get(base_url, params=params, timeout=15)
+
+            # Check for HTTP errors
+            if response.status_code == 401:
+                st.error("Invalid API key. Please check your GOOGLE_API_KEY in .streamlit/secrets.toml")
+                return []
+            elif response.status_code == 403:
+                st.error("API access forbidden. Ensure 'Fact Check Tools API' is enabled in Google Cloud Console.")
+                return []
+            elif response.status_code == 429:
+                st.error("API rate limit exceeded. Please try again later with fewer claims.")
+                return []
+
+            response.raise_for_status()
+            data = response.json()
+
+            # Check if response has claims
+            if 'claims' not in data or not data['claims']:
+                placeholder.success(f"Fetched {len(collected_claims)} claims (no more available)")
+                break
+
+            # Process each claim
+            for claim_obj in data['claims']:
+                if len(collected_claims) >= num_claims:
+                    break
+
+                # Extract claim text
+                claim_text = claim_obj.get('text', '')
+
+                # Extract rating from first claimReview
+                claim_reviews = claim_obj.get('claimReview', [])
+                if not claim_reviews or len(claim_reviews) == 0:
+                    continue  # Skip claims without reviews
+
+                textual_rating = claim_reviews[0].get('textualRating', '')
+
+                # Skip if missing required fields
+                if not claim_text or not textual_rating:
+                    continue
+
+                collected_claims.append({
+                    'claim_text': claim_text,
+                    'rating': textual_rating
+                })
+
+            # Check for next page
+            page_token = data.get('nextPageToken')
+            if not page_token:
+                placeholder.success(f"Fetched {len(collected_claims)} claims (all pages processed)")
+                break
+
+        placeholder.success(f"Successfully fetched {len(collected_claims)} claims from Google Fact Check API")
+        return collected_claims
+
+    except requests.exceptions.RequestException as e:
+        placeholder.error(f"Network error while fetching Google claims: {e}")
+        return collected_claims if collected_claims else []
+    except Exception as e:
+        placeholder.error(f"Error processing Google API response: {e}")
+        return collected_claims if collected_claims else []
+
+
+def process_and_map_google_claims(api_results):
+    """
+    Converts Google's granular ratings into binary format (1=True, 0=False) and creates DataFrame.
+    Discards ambiguous ratings like 'Half True', 'Mixed', etc.
+    """
+    if not api_results:
+        return pd.DataFrame(columns=['claim_text', 'ground_truth'])
+
+    processed_claims = []
+    true_count = 0
+    false_count = 0
+    discarded_count = 0
+
+    for claim_data in api_results:
+        claim_text = claim_data.get('claim_text', '').strip()
+        rating = claim_data.get('rating', '').strip()
+
+        # Data quality checks
+        if not claim_text or len(claim_text) < 10:
+            discarded_count += 1
+            continue
+
+        if not rating:
+            discarded_count += 1
+            continue
+
+        # Normalize rating for comparison (remove punctuation, lowercase)
+        rating_normalized = rating.lower().strip().rstrip('!').rstrip('?')
+
+        # Map to binary
+        is_true = any(rating_normalized == r.lower() for r in GOOGLE_TRUE_RATINGS)
+        is_false = any(rating_normalized == r.lower() for r in GOOGLE_FALSE_RATINGS)
+
+        if is_true:
+            processed_claims.append({
+                'claim_text': claim_text,
+                'ground_truth': 1
+            })
+            true_count += 1
+        elif is_false:
+            processed_claims.append({
+                'claim_text': claim_text,
+                'ground_truth': 0
+            })
+            false_count += 1
+        else:
+            # Ambiguous rating - discard
+            discarded_count += 1
+
+    # Create DataFrame
+    google_df = pd.DataFrame(processed_claims)
+
+    if not google_df.empty:
+        # Remove duplicates (keep first occurrence)
+        google_df = google_df.drop_duplicates(subset=['claim_text'], keep='first')
+
+    # Display statistics
+    total_processed = len(api_results)
+    st.info(f"Processed {total_processed} claims: {true_count} True, {false_count} False, {discarded_count} ambiguous (discarded)")
+
+    # Warn if only one class
+    if not google_df.empty and len(google_df['ground_truth'].unique()) < 2:
+        st.warning("Only one class found in processed claims. Results may not be meaningful.")
+
+    return google_df
+
+
+def run_google_benchmark(google_df, trained_models, vectorizer, selected_phase):
+    """
+    Tests trained models on Google claims and calculates performance metrics.
+    """
+    if google_df.empty:
+        st.error("No Google claims available for benchmarking.")
+        return pd.DataFrame()
+
+    # Extract claim texts and ground truth labels
+    X_raw = google_df['claim_text']
+    y_true = google_df['ground_truth'].values
+
+    # Apply same feature extraction as training
+    try:
+        if selected_phase == "Lexical & Morphological":
+            X_processed = X_raw.apply(lexical_features)
+            if vectorizer is None:
+                st.error("Vectorizer not found for Lexical phase. Please retrain models.")
+                return pd.DataFrame()
+            X_features = vectorizer.transform(X_processed)
+
+        elif selected_phase == "Syntactic":
+            X_processed = X_raw.apply(syntactic_features)
+            if vectorizer is None:
+                st.error("Vectorizer not found for Syntactic phase. Please retrain models.")
+                return pd.DataFrame()
+            X_features = vectorizer.transform(X_processed)
+
+        elif selected_phase == "Discourse":
+            X_processed = X_raw.apply(discourse_features)
+            if vectorizer is None:
+                st.error("Vectorizer not found for Discourse phase. Please retrain models.")
+                return pd.DataFrame()
+            X_features = vectorizer.transform(X_processed)
+
+        elif selected_phase == "Semantic":
+            # Dense features - no vectorizer needed
+            X_features = pd.DataFrame(X_raw.apply(semantic_features).tolist(), columns=["polarity", "subjectivity"]).values
+
+        elif selected_phase == "Pragmatic":
+            # Dense features - no vectorizer needed
+            X_features = pd.DataFrame(X_raw.apply(pragmatic_features).tolist(), columns=pragmatic_words).values
+
+        else:
+            st.error(f"Unknown feature phase: {selected_phase}")
+            return pd.DataFrame()
+
+    except Exception as e:
+        st.error(f"Feature extraction failed for Google claims: {e}")
+        return pd.DataFrame()
+
+    # Test each trained model
+    results_list = []
+
+    for model_name, model in trained_models.items():
+        try:
+            # Handle Naive Bayes with negative values (same as training)
+            if model_name == "Naive Bayes":
+                X_features_model = np.abs(X_features).astype(float)
+            else:
+                X_features_model = X_features
+
+            # Measure inference time
+            start_inference = time.time()
+            y_pred = model.predict(X_features_model)
+            inference_time = (time.time() - start_inference) * 1000  # Convert to ms
+
+            # Calculate metrics
+            accuracy = accuracy_score(y_true, y_pred) * 100
+            f1 = f1_score(y_true, y_pred, average='weighted', zero_division=0)
+            precision = precision_score(y_true, y_pred, average='weighted', zero_division=0)
+            recall = recall_score(y_true, y_pred, average='weighted', zero_division=0)
+
+            results_list.append({
+                'Model': model_name,
+                'Accuracy': accuracy,
+                'F1-Score': f1,
+                'Precision': precision,
+                'Recall': recall,
+                'Inference Latency (ms)': round(inference_time, 2)
+            })
+
+        except Exception as e:
+            st.error(f"Prediction failed for {model_name}: {e}")
+            results_list.append({
+                'Model': model_name,
+                'Accuracy': 0,
+                'F1-Score': 0,
+                'Precision': 0,
+                'Recall': 0,
+                'Inference Latency (ms)': 9999
+            })
+
+    return pd.DataFrame(results_list)
 
 # ============================
 # 1. WEB SCRAPING FUNCTION (Remains identical to previous successful version)
@@ -360,8 +621,51 @@ def evaluate_models(df: pd.DataFrame, selected_phase: str):
                 "Training Time (s)": 0, "Inference Latency (ms)": 9999,
             }
 
+    # 5. TRAIN FINAL MODELS ON FULL DATASET (for Google benchmark)
+    st.caption("Training final models on complete dataset for benchmarking...")
+    trained_models_final = {}
+
+    for name in models_to_run.keys():
+        try:
+            # Get fresh model instance
+            final_model = get_classifier(name)
+
+            # Prepare features for final training
+            if vectorizer is not None:
+                # Transform using the fitted vectorizer
+                if 'Lexical' in selected_phase:
+                    X_final_processed = X_raw.apply(lexical_features)
+                elif 'Syntactic' in selected_phase:
+                    X_final_processed = X_raw.apply(syntactic_features)
+                elif 'Discourse' in selected_phase:
+                    X_final_processed = X_raw.apply(discourse_features)
+                else:
+                    X_final_processed = X_raw
+                X_final = vectorizer.transform(X_final_processed)
+            else:
+                # Dense features (Semantic/Pragmatic)
+                X_final = X_features_full
+
+            # Apply SMOTE and train (same pattern as K-Fold)
+            if name == "Naive Bayes":
+                X_final_train = np.abs(X_final).astype(float)
+                final_model.fit(X_final_train, y)
+                trained_models_final[name] = final_model
+            else:
+                # Apply SMOTE to full dataset for other models
+                smote_pipeline_final = ImbPipeline([
+                    ('sampler', SMOTE(random_state=42, k_neighbors=3)),
+                    ('classifier', final_model)
+                ])
+                smote_pipeline_final.fit(X_final, y)
+                trained_models_final[name] = smote_pipeline_final
+
+        except Exception as e:
+            st.warning(f"Failed to train final {name} model: {e}")
+            trained_models_final[name] = None
+
     results_list = list(model_metrics.values())
-    return pd.DataFrame(results_list)
+    return pd.DataFrame(results_list), trained_models_final, vectorizer
 
 # ============================
 # 4. HUMOR & CRITIQUE FUNCTIONS (REMAINS UNCHANGED)
@@ -463,6 +767,14 @@ def app():
         st.session_state['scraped_df'] = pd.DataFrame()
     if 'df_results' not in st.session_state:
         st.session_state['df_results'] = pd.DataFrame()
+    if 'trained_models' not in st.session_state:
+        st.session_state['trained_models'] = {}
+    if 'trained_vectorizer' not in st.session_state:
+        st.session_state['trained_vectorizer'] = None
+    if 'google_benchmark_results' not in st.session_state:
+        st.session_state['google_benchmark_results'] = pd.DataFrame()
+    if 'google_df' not in st.session_state:
+        st.session_state['google_df'] = pd.DataFrame()
 
     # ============================
     # LEFT COLUMN (Data Input & Controls)
@@ -507,10 +819,70 @@ def app():
                 st.error("Please scrape data first!")
             else:
                 with st.spinner(f"Engaging {selected_phase} features... training 4 models with {N_SPLITS}-Fold CV & SMOTE!"):
-                    df_results = evaluate_models(st.session_state['scraped_df'], selected_phase)
+                    df_results, trained_models, trained_vectorizer = evaluate_models(st.session_state['scraped_df'], selected_phase)
                     st.session_state['df_results'] = df_results
+                    st.session_state['trained_models'] = trained_models
+                    st.session_state['trained_vectorizer'] = trained_vectorizer
                     st.session_state['selected_phase_run'] = selected_phase
                     st.success("Analysis complete! Prepare for the robust, cross-validated results.")
+
+        st.divider()
+        st.header("3. Real-Time Benchmark")
+        st.subheader("Google Fact Check Test 🌐")
+
+        num_google_claims = st.number_input(
+            "Number of claims to test:",
+            min_value=10,
+            max_value=1000,
+            value=100,
+            step=10,
+            key='num_google_claims'
+        )
+
+        st.caption("This will fetch live claims from Google Fact Check API and test your trained models against them.")
+
+        if st.button("Run Real-Time Benchmark 🚀"):
+            # Pre-flight check: models must be trained
+            if 'trained_models' not in st.session_state or not st.session_state['trained_models']:
+                st.error("Please train models first using 'Analyze Model Showdown'!")
+            # Pre-flight check: API key must exist
+            elif 'GOOGLE_API_KEY' not in st.secrets:
+                st.error("""
+Google API key not found. Please add it to .streamlit/secrets.toml:
+
+1. Create file: .streamlit/secrets.toml
+2. Add line: GOOGLE_API_KEY = "your-api-key-here"
+3. Get API key from: https://console.cloud.google.com/apis/credentials
+4. Enable "Fact Check Tools API" in your Google Cloud project
+""")
+            else:
+                # Execute benchmark
+                with st.spinner('Fetching and processing live data from Google...'):
+                    api_key = st.secrets["GOOGLE_API_KEY"]
+                    api_results = fetch_google_claims(api_key, num_google_claims)
+                    google_df = process_and_map_google_claims(api_results)
+
+                    if google_df.empty:
+                        st.warning("No claims were successfully processed. Try increasing the number or check API status.")
+                    elif len(google_df['ground_truth'].unique()) < 2:
+                        st.warning("Only one class found in Google data. Results may not be meaningful.")
+                        # Continue anyway - still run benchmark
+                        trained_models = st.session_state['trained_models']
+                        trained_vectorizer = st.session_state['trained_vectorizer']
+                        selected_phase_run = st.session_state['selected_phase_run']
+                        benchmark_results_df = run_google_benchmark(google_df, trained_models, trained_vectorizer, selected_phase_run)
+                        st.session_state['google_benchmark_results'] = benchmark_results_df
+                        st.session_state['google_df'] = google_df
+                        st.success(f"Benchmark complete! Tested on {len(google_df)} Google claims.")
+                    else:
+                        # Normal flow
+                        trained_models = st.session_state['trained_models']
+                        trained_vectorizer = st.session_state['trained_vectorizer']
+                        selected_phase_run = st.session_state['selected_phase_run']
+                        benchmark_results_df = run_google_benchmark(google_df, trained_models, trained_vectorizer, selected_phase_run)
+                        st.session_state['google_benchmark_results'] = benchmark_results_df
+                        st.session_state['google_df'] = google_df
+                        st.success(f"Benchmark complete! Tested on {len(google_df)} Google claims.")
 
 
     # ============================
@@ -545,6 +917,51 @@ def app():
                  st.bar_chart(df_plot, color="#33FF57")
             
             st.caption(f"Chart shows how each model performed on the selected metric using the **{st.session_state['selected_phase_run']}** features. Results are averaged over {N_SPLITS} folds.")
+
+        # Google Benchmark Results Display
+        if st.session_state['google_benchmark_results'].empty is False:
+            st.divider()
+            st.subheader("Google Fact Check Benchmark Results")
+
+            google_results = st.session_state['google_benchmark_results']
+            politifacts_results = st.session_state['df_results']
+
+            # Display metrics with comparison deltas
+            st.write("**Model Performance on Google Data:**")
+            cols = st.columns(4)
+            for idx, (_, row) in enumerate(google_results.iterrows()):
+                model_name = row['Model']
+                google_accuracy = row['Accuracy']
+
+                # Find corresponding Politifacts accuracy for delta
+                politifacts_row = politifacts_results[politifacts_results['Model'] == model_name]
+                if not politifacts_row.empty:
+                    politifacts_accuracy = politifacts_row['Accuracy'].values[0]
+                    delta = google_accuracy - politifacts_accuracy
+                else:
+                    delta = None
+
+                with cols[idx]:
+                    if delta is not None:
+                        st.metric(
+                            label=model_name,
+                            value=f"{google_accuracy:.1f}%",
+                            delta=f"{delta:+.1f}%"
+                        )
+                    else:
+                        st.metric(
+                            label=model_name,
+                            value=f"{google_accuracy:.1f}%"
+                        )
+
+            # Detailed metrics table
+            st.dataframe(
+                google_results[['Model', 'Accuracy', 'F1-Score', 'Precision', 'Recall', 'Inference Latency (ms)']],
+                use_container_width=True,
+                height=200
+            )
+
+            st.caption(f"Google benchmark tested on {len(st.session_state['google_df'])} claims. Comparing against Politifacts performance with same {st.session_state['selected_phase_run']} features.")
 
 
     # ============================
